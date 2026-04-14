@@ -3,21 +3,15 @@
 /**
  * platform-test-mcp-server
  *
- * An MCP (Model Context Protocol) Server that exposes the
- * platform-test-automation scripts as tools for VS Code Copilot.
+ * MCP Server for VS Code Copilot — provides tools that Copilot can't do itself:
+ *   - analyze_diff      — Read & classify git changes across repos
+ *   - run_tests         — Execute Cypress tests and report results
+ *   - list_generated    — List existing generated test files
  *
- * Tools exposed:
- *   - analyze_diff     — Read & classify git changes from platform repos
- *   - generate_tests   — AI-generate Cypress tests from git diff
- *   - run_tests        — Execute Cypress tests
- *   - full_pipeline    — End-to-end: analyze → generate → run → report
- *   - list_generated   — List currently generated test files
+ * Test code GENERATION is done by Copilot itself (it IS the LLM).
+ * No external API key needed.
  *
- * Transport: stdio (VS Code launches this process directly)
- *
- * Configuration:
- *   Set AUTOMATION_ROOT env var to the platform-test-automation project root.
- *   Defaults to the parent directory of this server file.
+ * Transport: stdio (VS Code auto-launches via .vscode/mcp.json)
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -28,18 +22,15 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-// ─── Resolve paths ────────────────────────────────────────────────────────────
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AUTOMATION_ROOT = process.env.AUTOMATION_ROOT || path.resolve(__dirname, '..');
 
-// ─── Helper: run a script and capture output ─────────────────────────────────
+// ─── Helper: run a script ─────────────────────────────────────────────────────
 
 function runScript(script, args = []) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(AUTOMATION_ROOT, script);
-
     if (!fs.existsSync(scriptPath)) {
       reject(new Error(`Script not found: ${scriptPath}`));
       return;
@@ -51,71 +42,69 @@ function runScript(script, args = []) {
       shell: false,
     });
 
-    const outputLines = [];
+    const chunks = [];
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
-      const text = chunk.toString().replace(/\x1b\[[0-9;]*m/g, ''); // strip ANSI
-      outputLines.push(text);
+      chunks.push(chunk.toString().replace(/\x1b\[[0-9;]*m/g, ''));
     });
-
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString().replace(/\x1b\[[0-9;]*m/g, '');
     });
-
-    child.on('error', (err) => reject(err));
-
+    child.on('error', reject);
     child.on('close', (exitCode) => {
-      resolve({
-        exitCode: exitCode || 0,
-        stdout: outputLines.join(''),
-        stderr,
-      });
+      resolve({ exitCode: exitCode || 0, stdout: chunks.join(''), stderr });
     });
   });
 }
 
-// ─── Helper: list generated test files ────────────────────────────────────────
+// ─── Helper: list test files ──────────────────────────────────────────────────
 
-function listGeneratedTests() {
-  const generatedDir = path.join(AUTOMATION_ROOT, 'cypress', 'e2e', 'generated');
-  if (!fs.existsSync(generatedDir)) return [];
-
+function listTestFiles(subdir) {
+  const dir = path.join(AUTOMATION_ROOT, 'cypress', 'e2e', subdir);
+  if (!fs.existsSync(dir)) return [];
   const results = [];
-  function walk(dir) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        walk(path.join(dir, entry.name));
-      } else if (entry.name.endsWith('.cy.js')) {
-        const fullPath = path.join(dir, entry.name);
-        const stat = fs.statSync(fullPath);
+  function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(path.join(d, e.name));
+      else if (e.name.endsWith('.cy.js')) {
+        const full = path.join(d, e.name);
+        const stat = fs.statSync(full);
         results.push({
-          path: path.relative(AUTOMATION_ROOT, fullPath),
+          path: path.relative(AUTOMATION_ROOT, full),
           size: stat.size,
           modified: stat.mtime.toISOString(),
         });
       }
     }
   }
-  walk(generatedDir);
+  walk(dir);
   return results;
+}
+
+// ─── Helper: read file content ────────────────────────────────────────────────
+
+function readFileContent(filePath) {
+  const full = path.resolve(AUTOMATION_ROOT, filePath);
+  if (!fs.existsSync(full)) return null;
+  return fs.readFileSync(full, 'utf8');
 }
 
 // ─── Create MCP Server ───────────────────────────────────────────────────────
 
 const server = new McpServer({
   name: 'platform-test',
-  version: '1.0.0',
-  description: 'AI-powered Cypress test automation for platform-server and platform-web',
+  version: '2.0.0',
+  description: 'Cypress test automation tools for platform-server and platform-web',
 });
 
 // ─── Tool: analyze_diff ─────────────────────────────────────────────────────
 
 server.tool(
   'analyze_diff',
-  'Analyze git diffs from platform-server and/or platform-web. Classifies changed files into categories (controller, service, page, component, etc.) without generating tests.',
+  'Analyze git diffs from platform-server and/or platform-web. Returns changed files classified by type (controller, service, page, component, etc.) with diff content. Use this to understand what changed before generating tests.',
   {
-    repo: z.enum(['server', 'web', 'all']).default('all').describe('Which repo to analyze'),
+    repo: z.enum(['server', 'web', 'all']).default('all').describe('Which repo to analyze: server, web, or all'),
     range: z.string().default('HEAD~1').describe('Git diff range, e.g. HEAD~1, main..develop, abc123..def456'),
   },
   async ({ repo, range }) => {
@@ -123,58 +112,19 @@ server.tool(
       const result = await runScript('scripts/analyze-diff.js', [
         '--repo', repo,
         '--range', range,
+        '--output', 'json',
       ]);
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: result.exitCode === 0
-              ? `✅ Diff analysis complete (${repo}, range: ${range}):\n\n${result.stdout}`
-              : `❌ Analysis failed (exit code ${result.exitCode}):\n${result.stderr || result.stdout}`,
-          },
-        ],
+        content: [{
+          type: 'text',
+          text: result.exitCode === 0
+            ? `Diff analysis (${repo}, range: ${range}):\n\n${result.stdout}`
+            : `Analysis failed (exit ${result.exitCode}):\n${result.stderr || result.stdout}`,
+        }],
       };
     } catch (err) {
-      return { content: [{ type: 'text', text: `❌ Error: ${err.message}` }] };
-    }
-  }
-);
-
-// ─── Tool: generate_tests ────────────────────────────────────────────────────
-
-server.tool(
-  'generate_tests',
-  'Analyze git diff and generate Cypress test files using AI. Backend changes produce API contract tests (cy.request), frontend changes produce E2E UI tests (cy.visit). Generated tests are written to cypress/e2e/generated/.',
-  {
-    repo: z.enum(['server', 'web', 'all']).default('all').describe('Which repo to analyze'),
-    range: z.string().default('HEAD~1').describe('Git diff range'),
-  },
-  async ({ repo, range }) => {
-    try {
-      const result = await runScript('scripts/run-automation.js', [
-        '--repo', repo,
-        '--range', range,
-        '--generate-only',
-      ]);
-
-      const generatedFiles = listGeneratedTests();
-      const fileList = generatedFiles.length > 0
-        ? '\n\nGenerated files:\n' + generatedFiles.map(f => `  • ${f.path}`).join('\n')
-        : '\n\nNo test files were generated.';
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: result.exitCode === 0
-              ? `✅ Test generation complete (${repo}, range: ${range}):${fileList}\n\n${result.stdout}`
-              : `❌ Generation failed (exit code ${result.exitCode}):\n${result.stderr || result.stdout}`,
-          },
-        ],
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `❌ Error: ${err.message}` }] };
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
   }
 );
@@ -183,11 +133,11 @@ server.tool(
 
 server.tool(
   'run_tests',
-  'Run Cypress tests. Can run generated tests, baseline smoke tests, or all. Returns pass/fail results.',
+  'Execute Cypress tests and return pass/fail results. Can run generated tests, baseline smoke tests, or all tests.',
   {
-    spec: z.enum(['generated', 'baseline', 'all']).default('generated').describe('Which test suite to run'),
+    spec: z.enum(['generated', 'baseline', 'all']).default('generated').describe('Which tests to run'),
     browser: z.enum(['electron', 'chrome', 'firefox']).default('electron').describe('Browser to use'),
-    headed: z.boolean().default(false).describe('Run with visible browser window'),
+    headed: z.boolean().default(false).describe('Show browser window (for debugging)'),
   },
   async ({ spec, browser, headed }) => {
     try {
@@ -197,59 +147,15 @@ server.tool(
       const result = await runScript('scripts/run-automation.js', args);
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: result.exitCode === 0
-              ? `✅ Cypress tests PASSED (spec: ${spec}):\n\n${result.stdout}`
-              : `❌ Cypress tests FAILED (exit code ${result.exitCode}):\n\n${result.stdout}\n${result.stderr}`,
-          },
-        ],
+        content: [{
+          type: 'text',
+          text: result.exitCode === 0
+            ? `✅ Tests PASSED (${spec}):\n\n${result.stdout}`
+            : `❌ Tests FAILED (exit ${result.exitCode}):\n\n${result.stdout}\n${result.stderr}`,
+        }],
       };
     } catch (err) {
-      return { content: [{ type: 'text', text: `❌ Error: ${err.message}` }] };
-    }
-  }
-);
-
-// ─── Tool: full_pipeline ─────────────────────────────────────────────────────
-
-server.tool(
-  'full_pipeline',
-  'Run the complete automation pipeline: analyze git diff → generate Cypress tests with AI → execute tests → produce HTML report. This is the one-command end-to-end flow.',
-  {
-    repo: z.enum(['server', 'web', 'all']).default('all').describe('Which repo to analyze'),
-    range: z.string().default('HEAD~1').describe('Git diff range'),
-    runBaseline: z.boolean().default(false).describe('Also run baseline smoke tests alongside generated ones'),
-  },
-  async ({ repo, range, runBaseline }) => {
-    try {
-      const args = ['--repo', repo, '--range', range];
-      if (runBaseline) args.push('--run-baseline');
-
-      const result = await runScript('scripts/run-automation.js', args);
-
-      const reportPath = path.join(AUTOMATION_ROOT, 'cypress', 'reports', 'html', 'combined.html');
-      const reportExists = fs.existsSync(reportPath);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: [
-              result.exitCode === 0
-                ? `✅ Full pipeline complete (${repo}, range: ${range})`
-                : `❌ Pipeline finished with errors (exit code ${result.exitCode})`,
-              '',
-              result.stdout,
-              result.stderr ? `\nStderr:\n${result.stderr}` : '',
-              reportExists ? `\n📊 HTML Report: ${reportPath}` : '',
-            ].join('\n'),
-          },
-        ],
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `❌ Error: ${err.message}` }] };
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
   }
 );
@@ -258,24 +164,77 @@ server.tool(
 
 server.tool(
   'list_generated',
-  'List all currently generated Cypress test files with their paths and last modified timestamps.',
+  'List all generated and baseline Cypress test files.',
   {},
   async () => {
-    const files = listGeneratedTests();
+    const generated = listTestFiles('generated');
+    const baseline = listTestFiles('baseline');
 
-    if (files.length === 0) {
-      return {
-        content: [{ type: 'text', text: 'No generated test files found in cypress/e2e/generated/.\nRun generate_tests first.' }],
-      };
+    const lines = [];
+    if (baseline.length > 0) {
+      lines.push(`Baseline tests (${baseline.length}):`);
+      baseline.forEach(f => lines.push(`  • ${f.path}`));
+    }
+    if (generated.length > 0) {
+      lines.push(`\nGenerated tests (${generated.length}):`);
+      generated.forEach(f => lines.push(`  • ${f.path}  (${f.modified})`));
+    }
+    if (lines.length === 0) {
+      lines.push('No test files found. Use Copilot to generate tests after analyzing diffs.');
     }
 
-    const table = files
-      .map(f => `  • ${f.path}  (${f.size} bytes, ${f.modified})`)
-      .join('\n');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
 
-    return {
-      content: [{ type: 'text', text: `📂 Generated test files (${files.length}):\n${table}` }],
-    };
+// ─── Tool: get_prompt_template ───────────────────────────────────────────────
+
+server.tool(
+  'get_prompt_template',
+  'Read the AI prompt template for test generation. Returns the template content that guides how Cypress tests should be structured. Copilot should use this template as guidance when generating test code.',
+  {
+    type: z.enum(['api', 'e2e']).describe('api = backend API tests, e2e = frontend UI tests'),
+  },
+  async ({ type }) => {
+    const fileName = type === 'api' ? 'api-test-prompt.md' : 'e2e-test-prompt.md';
+    const content = readFileContent(path.join('prompts', fileName));
+
+    if (!content) {
+      return { content: [{ type: 'text', text: `Template not found: prompts/${fileName}` }] };
+    }
+
+    return { content: [{ type: 'text', text: content }] };
+  }
+);
+
+// ─── Tool: save_test_file ────────────────────────────────────────────────────
+
+server.tool(
+  'save_test_file',
+  'Save a generated Cypress test file to the generated tests directory. Use this after Copilot has generated test code.',
+  {
+    fileName: z.string().describe('Test file name, e.g. user-api.cy.js or login-page.cy.js'),
+    repo: z.enum(['server', 'web']).describe('Which repo the test is for (determines subdirectory)'),
+    content: z.string().describe('The Cypress test code content'),
+  },
+  async ({ fileName, repo, content }) => {
+    try {
+      const dir = path.join(AUTOMATION_ROOT, 'cypress', 'e2e', 'generated', repo);
+      fs.mkdirSync(dir, { recursive: true });
+
+      const filePath = path.join(dir, fileName);
+      fs.writeFileSync(filePath, content, 'utf8');
+
+      const relativePath = path.relative(AUTOMATION_ROOT, filePath);
+      return {
+        content: [{
+          type: 'text',
+          text: `✅ Test saved: ${relativePath}\n\nRun it with the run_tests tool (spec: "generated").`,
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error saving file: ${err.message}` }] };
+    }
   }
 );
 
@@ -284,7 +243,6 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Server is now running, listening on stdin/stdout
 }
 
 main().catch((err) => {
