@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "platform-test": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-server/server.js"],
+      "env": {
+        "AUTOMATION_ROOT": "${workspaceFolder}",
+        "PLATFORM_SERVER_REPO": "/workspaces/platform-server",
+        "PLATFORM_WEB_REPO": "/workspaces/platform-web"
+      }
+    }
+  }
+}

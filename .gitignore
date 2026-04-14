@@ -1,0 +1,15 @@
+# .gitignore — platform-test-automation
+node_modules/
+.env
+
+# Cypress outputs
+cypress/videos/
+cypress/screenshots/
+cypress/reports/
+
+# Generated tests (optional: commit them if you want history)
+# cypress/e2e/generated/
+
+# OS
+.DS_Store
+Thumbs.db

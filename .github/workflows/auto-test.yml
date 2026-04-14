@@ -1,0 +1,163 @@
+name: Platform Auto Test — AI-Powered Cypress
+
+on:
+  # Trigger when platform-server or platform-web push to main/develop
+  repository_dispatch:
+    types:
+      - platform-server-push
+      - platform-web-push
+
+  # Also allow manual run from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Which repo changed: server | web | all'
+        required: false
+        default: 'all'
+      range:
+        description: 'Git diff range (e.g. HEAD~1 or abc..def)'
+        required: false
+        default: 'HEAD~1'
+      generate_only:
+        description: 'Only generate tests, do not run Cypress'
+        type: boolean
+        default: false
+
+  # Or trigger on push to this repo's own branches
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'prompts/**'
+      - 'cypress/**'
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  auto-test:
+    name: AI Generate + Cypress Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout this automation repo ─────────────────────────────────────
+      - name: Checkout platform-test-automation
+        uses: actions/checkout@v4
+
+      # ── 2. Checkout platform-server ──────────────────────────────────────────
+      - name: Checkout platform-server
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/platform-server     # ← Change to your actual org/repo
+          token: ${{ secrets.GH_PAT }}
+          path: ../platform-server
+          fetch-depth: 10                           # Fetch enough history for diff
+
+      # ── 3. Checkout platform-web ─────────────────────────────────────────────
+      - name: Checkout platform-web
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/platform-web         # ← Change to your actual org/repo
+          token: ${{ secrets.GH_PAT }}
+          path: ../platform-web
+          fetch-depth: 10
+
+      # ── 4. Setup Node ─────────────────────────────────────────────────────────
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      # ── 5. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 6. Determine diff range ───────────────────────────────────────────────
+      - name: Resolve diff parameters
+        id: params
+        run: |
+          REPO="${{ github.event.inputs.repo || github.event.client_payload.repo || 'all' }}"
+          RANGE="${{ github.event.inputs.range || github.event.client_payload.range || 'HEAD~1' }}"
+          echo "repo=${REPO}" >> $GITHUB_OUTPUT
+          echo "range=${RANGE}" >> $GITHUB_OUTPUT
+          echo "Analyzing repo: ${REPO}, range: ${RANGE}"
+
+      # ── 7. Run full automation pipeline ──────────────────────────────────────
+      - name: Run automation pipeline
+        env:
+          # AI Configuration
+          AI_PROVIDER: ${{ secrets.AI_PROVIDER || 'openai' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o' }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+
+          # Repo paths (relative to workspace)
+          PLATFORM_SERVER_REPO: ${{ github.workspace }}/../platform-server
+          PLATFORM_WEB_REPO: ${{ github.workspace }}/../platform-web
+
+          # Test environment
+          CYPRESS_BASE_URL: ${{ secrets.CYPRESS_BASE_URL || 'http://localhost:3000' }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL || 'http://localhost:8080' }}
+          TEST_USERNAME: ${{ secrets.TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+
+          # Diff options
+          DEFAULT_DIFF_RANGE: ${{ steps.params.outputs.range }}
+        run: |
+          node scripts/run-automation.js \
+            --repo ${{ steps.params.outputs.repo }} \
+            --range ${{ steps.params.outputs.range }} \
+            ${{ github.event.inputs.generate_only == 'true' && '--generate-only' || '' }}
+
+      # ── 8. Upload generated test files ───────────────────────────────────────
+      - name: Upload generated tests
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generated-cypress-tests
+          path: cypress/e2e/generated/
+          retention-days: 14
+
+      # ── 9. Upload Cypress reports ─────────────────────────────────────────────
+      - name: Upload Cypress reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cypress-reports
+          path: |
+            cypress/reports/
+            cypress/screenshots/
+            cypress/videos/
+          retention-days: 14
+
+      # ── 10. Upload HTML report to GitHub Pages (optional) ────────────────────
+      # Uncomment if you want reports published as GitHub Pages
+      # - name: Deploy report to GitHub Pages
+      #   uses: peaceiris/actions-gh-pages@v4
+      #   if: always()
+      #   with:
+      #     github_token: ${{ secrets.GITHUB_TOKEN }}
+      #     publish_dir: cypress/reports/html
+
+      # ── 11. Comment on PR (if triggered by PR webhook) ────────────────────────
+      - name: Post results comment
+        if: always() && github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const conclusion = '${{ job.status }}';
+            const emoji = conclusion === 'success' ? '✅' : '❌';
+            const body = `## ${emoji} Platform Auto Test Result
+
+            **Status**: ${conclusion}
+            **Triggered by**: ${{ github.event.client_payload.repo || 'manual' }}
+            **Diff range**: ${{ steps.params.outputs.range }}
+
+            [View full report →](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            `;
+            // Post to PR or commit if context available
+            console.log(body);
